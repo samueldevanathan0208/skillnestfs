@@ -4,5 +4,6 @@ class CreateQuiz(BaseModel):
     result_id: int
     quiz_id: int
     user_id: int
+    course_name: str
     score: int
     attempt_date: str

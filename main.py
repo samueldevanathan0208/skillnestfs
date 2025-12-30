@@ -1,8 +1,10 @@
 from fastapi import FastAPI, Depends, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import List
 import sys
+import os
 from pathlib import Path
 
 # Ensure project root is on sys.path so sibling packages can be imported
@@ -19,17 +21,31 @@ from py_schemas.course_schemas import Create_course
 from py_schemas.quizz_schemas import CreateQuiz
 from py_schemas.enrollment_schemas import EnrollmentCreate, EnrollmentUpdate, EnrollmentResponse
 
-app = FastAPI()
+app = FastAPI(title="Skillnest API", version="1.0.0")
+
+# In development, allow all origins to support local testing (including file:// origin 'null')
+ALLOWED_ORIGINS = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+from sqlalchemy import text
 Base.metadata.create_all(bind=engine)
+
+# Auto-migration: Ensure new columns exist in the enrollments table
+with engine.connect() as conn:
+    try:
+        conn.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS certificate_id VARCHAR;"))
+        conn.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS completed_videos VARCHAR DEFAULT '[]';"))
+        conn.commit()
+        print("INFO: Database migrations applied successfully.")
+    except Exception as e:
+        print(f"WARNING: Migration error (possibly column already exists): {e}")
 
 @app.get("/")
 def get_all_user(db: Session = Depends(get_db)):
@@ -166,7 +182,8 @@ def update_progress(data: EnrollmentUpdate, db: Session = Depends(get_db)):
             course_name=data.course_name,
             video_progress=data.video_progress,
             is_completed=data.is_completed,
-            learning_hours=data.learning_hours
+            learning_hours=data.learning_hours,
+            completed_videos=data.completed_videos
         )
         db.add(enrollment)
     else:
@@ -174,6 +191,7 @@ def update_progress(data: EnrollmentUpdate, db: Session = Depends(get_db)):
         if data.is_completed:
             enrollment.is_completed = True
         enrollment.learning_hours = data.learning_hours
+        enrollment.completed_videos = data.completed_videos
         
     db.commit()
     return {"message": "Progress updated"}
@@ -201,6 +219,7 @@ def create_quiz(data: CreateQuiz, db: Session = Depends(get_db)):
         result_id=data.result_id,
         quiz_id=data.quiz_id,
         user_id=data.user_id,
+        course_name=data.course_name,
         score=data.score,
         attempt_date=data.attempt_date
     )
@@ -208,3 +227,98 @@ def create_quiz(data: CreateQuiz, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_quiz)
     return "quiz added successfully"
+
+def generate_certificate_id(user_id: int, course_name: str) -> str:
+    from datetime import datetime
+    course_codes = {
+        "HTML": "HTML", "CSS": "CSS", "JavaScript": "JS",
+        "Python": "PYTHON", "Java": "JAVA", "React": "REACT",
+        "FastAPI": "FASTAPI", "PostgreSQL": "POSTGRESQL"
+    }
+    course_code = course_codes.get(course_name, "COURSE")
+    year = datetime.now().year
+    unique_num = (user_id * 1000) + abs(hash(course_name)) % 10000
+    return f"CERT-{course_code}-{year}-{unique_num:04d}"
+
+@app.get("/certificates/{user_id}")
+def get_certificates(user_id: int, db: Session = Depends(get_db)):
+    from datetime import datetime
+    
+    enrollments = db.query(Enrollment).filter(
+        Enrollment.user_id == user_id,
+        Enrollment.is_completed == True
+    ).all()
+    
+    certificates = []
+    for enrollment in enrollments:
+        quiz = db.query(Quiz).filter(
+            Quiz.user_id == user_id,
+            func.lower(Quiz.course_name) == func.lower(enrollment.course_name)
+        ).order_by(Quiz.score.desc()).first()
+        
+        if quiz:
+            # Generate ID if missing or empty
+            if not enrollment.certificate_id or enrollment.certificate_id == "":
+                enrollment.certificate_id = generate_certificate_id(user_id, enrollment.course_name)
+                db.add(enrollment) # Explicitly add to session
+                db.commit()
+                db.refresh(enrollment) # Refresh to get the new ID
+            
+            certificates.append({
+                "course_name": enrollment.course_name,
+                "score": quiz.score,
+                "certificate_id": enrollment.certificate_id,
+                "issue_date": quiz.attempt_date,
+                "grade": f"{quiz.score}/100"
+            })
+    
+    return certificates
+
+@app.get("/quiz_score/{user_id}/{course_name}")
+def get_quiz_score(user_id: int, course_name: str, db: Session = Depends(get_db)):
+    quiz = db.query(Quiz).filter(
+        Quiz.user_id == user_id,
+        Quiz.course_name == course_name
+    ).order_by(Quiz.score.desc()).first()
+    
+    if quiz:
+        return {"course_name": course_name, "score": quiz.score, "attempt_date": quiz.attempt_date}
+    return {"course_name": course_name, "score": 0, "attempt_date": None}
+
+@app.get("/global_stats/{user_id}")
+def get_global_stats(user_id: int, db: Session = Depends(get_db)):
+    # 1. Courses completed
+    completed_courses = db.query(Enrollment).filter(
+        Enrollment.user_id == user_id,
+        Enrollment.is_completed == True
+    ).count()
+    
+    # 2. Perfect scores (100)
+    perfect_scores = db.query(Quiz).filter(
+        Quiz.user_id == user_id,
+        Quiz.score == 100
+    ).count()
+    
+    # 3. Total learning hours
+    total_hours = db.query(func.sum(Enrollment.learning_hours)).filter(
+        Enrollment.user_id == user_id
+    ).scalar() or 0.0
+    
+    # 4. Average Quiz Score
+    avg_score = db.query(func.avg(Quiz.score)).filter(
+        Quiz.user_id == user_id
+    ).scalar() or 0
+    
+    # 5. Total Quizzes Taken
+    total_quizzes = db.query(Quiz).filter(
+        Quiz.user_id == user_id
+    ).count()
+
+    return {
+        "completed_courses": completed_courses,
+        "perfect_scores": perfect_scores,
+        "total_hours": round(total_hours, 1),
+        "avg_score": round(avg_score, 1),
+        "total_quizzes": total_quizzes,
+        "streak": 1 # Placeholder for now, could be calculated from attempt_date
+    }

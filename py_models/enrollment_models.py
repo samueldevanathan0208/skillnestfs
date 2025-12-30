@@ -11,5 +11,7 @@ class Enrollment(Base):
     video_progress = Column(Integer, default=0) 
     is_completed = Column(Boolean, default=False)
     learning_hours = Column(Float, default=0.0)
+    certificate_id = Column(String, nullable=True)
+    completed_videos = Column(String, nullable=True, default="[]") # JSON list of video indexes
     
     user = relationship("User")

@@ -8,5 +8,6 @@ class Quiz(Base):
     result_id = Column(Integer, primary_key=True, index=True)
     quiz_id = Column(Integer)
     user_id = Column(Integer, ForeignKey("users.user_id"))
+    course_name = Column(String)
     score = Column(Integer)
     attempt_date = Column(String) 
